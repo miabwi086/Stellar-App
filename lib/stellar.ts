@@ -1,22 +1,34 @@
-// lib/stellar.ts
+// lib/stellar.ts (FIXED)
 import * as StellarSdk from '@stellar/stellar-sdk';
-import { getAddress, getNetwork, signTransaction } from '@stellar/freighter-api';
-
-// Deklarasi tipe untuk window.freighterApi
-declare global {
-  interface Window {
-    freighterApi?: unknown;
-  }
-}
+import {
+  isConnected,
+  isAllowed,
+  requestAccess,
+  getAddress,
+  getNetwork,
+  signTransaction,
+} from '@stellar/freighter-api';
 
 // Konfigurasi
 const HORIZON_URL = 'https://horizon-testnet.stellar.org';
 const NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
 const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 
-// 1. Cek apakah Freighter terinstal
-export const isFreighterInstalled = (): boolean => {
-  return typeof window !== 'undefined' && 'freighterApi' in window;
+// 1. Cek apakah Freighter terinstal (RETRY, karena content script butuh waktu inject)
+export const isFreighterInstalled = async (): Promise<boolean> => {
+  if (typeof window === 'undefined') return false;
+
+  // Coba 5x dengan jeda 100ms — Freighter perlu waktu inject setelah page load
+  for (let i = 0; i < 5; i++) {
+    try {
+      const connected = await isConnected();
+      if (connected) return true;
+    } catch {
+      // ignore — belum siap
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
 };
 
 // 2. Cek Network (harus Testnet)
@@ -34,17 +46,42 @@ export const checkNetwork = async (): Promise<boolean> => {
 
 // 3. Koneksi Wallet
 export const connectWallet = async (): Promise<string> => {
-  if (!isFreighterInstalled()) {
-    throw new Error('Freighter wallet tidak terinstal. Silakan install dari freighter.app');
+  const installed = await isFreighterInstalled();
+  if (!installed) {
+    throw new Error(
+      'Freighter tidak terdeteksi. Pastikan:\n' +
+        '1. Ekstensi Freighter sudah terpasang di browser (Chrome/Brave/Edge/Firefox)\n' +
+        '2. Anda mengakses app via http://localhost:3000 (BUKAN IP seperti 192.168.x.x)\n' +
+        '3. Tab di-refresh SETELAH install ekstensi\n' +
+        '4. Freighter tidak dimatikan di pengaturan ekstensi\n' +
+        '5. Bukan mode incognito (kecuali ekstensi diaktifkan untuk incognito)'
+    );
   }
 
   const isTestnet = await checkNetwork();
   if (!isTestnet) {
-    throw new Error('Mohon ganti network Freighter ke Testnet!');
+    throw new Error('Mohon ganti network Freighter ke Testnet (buka ekstensi → Settings → Network → Testnet).');
   }
 
-  // Gunakan getAddress, bukan getPublicKey
+  // Cek apakah app sudah diizinkan
+  let allowed = await isAllowed();
+  if (!allowed) {
+    // Minta izin — akan muncul popup Freighter
+    const accessResult = await requestAccess();
+    if (accessResult.error) {
+      throw new Error(`Akses ditolak: ${accessResult.error}`);
+    }
+    allowed = await isAllowed();
+  }
+  if (!allowed) {
+    throw new Error('Akses ke Freighter belum diizinkan. Buka ekstensi Freighter untuk approve.');
+  }
+
+  // Gunakan getAddress untuk ambil alamat publik
   const result = await getAddress();
+  if (result.error) {
+    throw new Error(`Gagal ambil alamat: ${result.error}`);
+  }
   return result.address;
 };
 
@@ -108,8 +145,11 @@ export const sendXLM = async (
       networkPassphrase: NETWORK_PASSPHRASE,
     });
 
-    const signedXDR = signed.signedTxXdr;
+    if (signed.error) {
+      return { success: false, error: `Sign gagal: ${signed.error}` };
+    }
 
+    const signedXDR = signed.signedTxXdr;
     const submittedTransaction = StellarSdk.TransactionBuilder.fromXDR(
       signedXDR,
       NETWORK_PASSPHRASE
