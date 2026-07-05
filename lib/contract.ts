@@ -1,21 +1,26 @@
-// lib/contract.ts — Soroban contract call helpers (FIXED for txMalformed error)
+// lib/contract.ts — Soroban contract call helpers (FIXED v3 for stellar-sdk 13.3)
 //
-// Fix utama: pakai server.prepareTransaction() daripada manual rebuild.
-// Ini menangani sorobanData + auth + sequence number dengan benar.
+// Perubahan dari v2:
+// 1. retval bisa string (base64) ATAU object (ScVal) — handle dua-duanya
+// 2. Pakai assembleTransaction() dari rpc — bukan server.prepareTransaction()
+//    (di v13.3, prepareTransaction return type tidak konsisten)
+// 3. Fallback ke SorobanDataBuilder manual kalau assembleTransaction gagal
 
 import {
   Account,
   Address,
   Contract,
+  Keypair,
   Networks,
   rpc,
   TransactionBuilder,
   nativeToScVal,
   scValToNative,
   xdr,
+  type Transaction,
 } from '@stellar/stellar-sdk';
+import Simulation from "@stellar/stellar-sdk"
 import { signXDR, type WalletSession } from './wallet';
-import { Keypair } from '@stellar/stellar-sdk';
 
 const RPC_URL = 'https://soroban-testnet.stellar.org';
 const NETWORK_PASSPHRASE = Networks.TESTNET;
@@ -29,14 +34,67 @@ const debug = (...args: unknown[]) => {
   console.log('%c[contract]', 'color: #10b981; font-weight: bold', ...args);
 };
 
-// ====== Read-only: get_results (simulasi, tidak perlu sign) ======
+// Dummy keypair valid untuk read-only simulation
+const DUMMY_KEYPAIR = Keypair.fromRawEd25519Seed(new Uint8Array(32).fill(1));
+const DUMMY_PUBLIC_KEY = DUMMY_KEYPAIR.publicKey();
+
+// ====== Helper: extract retval dari simulation response ======
+
+function extractRetval(sim: Simulation.Response): xdr.ScVal {
+  // v13.x: retval bisa string base64 ATAU object ScVal langsung
+  const retval =
+    (sim as { result?: { retval?: unknown } }).result?.retval ??
+    (sim as { retval?: unknown }).retval;
+
+  if (!retval) {
+    throw new Error('Simulasi tidak mengembalikan retval');
+  }
+
+  if (typeof retval === 'string') {
+    // base64 string
+    return xdr.ScVal.fromXDR(retval, 'base64');
+  }
+
+  // Sudah ScVal object
+  if (retval && typeof retval === 'object' && 'toXDR' in retval) {
+    return retval as xdr.ScVal;
+  }
+
+  // Fallback: coba assume itu raw XDR object
+  try {
+    return xdr.ScVal.fromXDR(Buffer.from(retval as Uint8Array));
+  } catch {
+    throw new Error(`Format retval tidak dikenali: ${typeof retval}`);
+  }
+}
+
+// ====== Helper: extract soroban data dari simulation ======
+
+function extractSorobanData(sim: Simulation.Response): xdr.SorobanTransactionData {
+  // v13.x: bisa di sim.result.sorobanData, sim.sorobanData, atau sim.result.transactionData
+  const candidates = [
+    (sim as { result?: { sorobanData?: string } }).result?.sorobanData,
+    (sim as { sorobanData?: string }).sorobanData,
+    (sim as { result?: { transactionData?: string } }).result?.transactionData,
+  ];
+
+  for (const c of candidates) {
+    if (typeof c === 'string') {
+      return xdr.SorobanTransactionData.fromXDR(c, 'base64');
+    }
+    if (c && typeof c === 'object' && 'toXDR' in c) {
+      return c as xdr.SorobanTransactionData;
+    }
+  }
+
+  throw new Error('Tidak bisa extract sorobanData dari simulasi');
+}
+
+// ====== Read-only: get_results ======
 
 export async function getResults(): Promise<{ coffee: number; tea: number }> {
   const contract = new Contract(CONTRACT_ID);
 
-  // Dummy source account untuk simulation (read-only, tidak butuh saldo)
-  const DUMMY_KEYPAIR = Keypair.fromRawEd25519Seed(new Uint8Array(32).fill(1));
-  const DUMMY_PUBLIC_KEY = DUMMY_KEYPAIR.publicKey(); // StrKey valid
   const dummy = new Account(DUMMY_PUBLIC_KEY, '0');
 
   const tx = new TransactionBuilder(dummy, {
@@ -53,22 +111,12 @@ export async function getResults(): Promise<{ coffee: number; tea: number }> {
     throw new Error(`Simulasi gagal: ${JSON.stringify(sim.error)}`);
   }
 
-  // Handle berbagai kemungkinan struktur response di stellar-sdk v13
-  const retval =
-    sim.result?.retval ??
-    (sim as { retval?: string }).retval ??
-    sim.result?.result?.retval;
-
-  if (!retval) {
-    debug('Sim response (no retval):', sim);
-    throw new Error('Simulasi tidak mengembalikan retval');
-  }
-
-  const scVal = xdr.ScVal.fromXDR(retval, 'base64');
+  const scVal = extractRetval(sim);
   const result = scValToNative(scVal);
 
-  // get_results return tuple (u32, u32) → di JS bisa array [coffee, tea]
-  // atau object {0: coffee, 1: tea} tergantung versi SDK
+  debug('getResults raw:', result);
+
+  // Tuple (u32, u32) → array atau object {0, 1}
   let coffee: number;
   let tea: number;
   if (Array.isArray(result)) {
@@ -84,7 +132,7 @@ export async function getResults(): Promise<{ coffee: number; tea: number }> {
   return { coffee: Number(coffee) || 0, tea: Number(tea) || 0 };
 }
 
-// ====== Write: vote (butuh sign dari wallet) ======
+// ====== Write: vote ======
 
 export async function submitVote(
   session: WalletSession,
@@ -94,11 +142,11 @@ export async function submitVote(
 
   const contract = new Contract(CONTRACT_ID);
 
-  // 1. Load source account (dengan sequence number terbaru)
+  // 1. Load source account
   let sourceAccount: Account;
   try {
     sourceAccount = await server.getAccount(session.publicKey);
-    debug('Source account loaded, sequence:', sourceAccount.sequenceNumber());
+    debug('Source account loaded, seq:', sourceAccount.sequenceNumber());
   } catch (e) {
     debug('Gagal load account:', e);
     throw new Error(
@@ -106,7 +154,7 @@ export async function submitVote(
     );
   }
 
-  // 2. Build transaction awal (akan di-prepare ulang dengan soroban data)
+  // 2. Build unsigned transaction
   const unsignedTx = new TransactionBuilder(sourceAccount, {
     fee: '10000',
     networkPassphrase: NETWORK_PASSPHRASE,
@@ -118,12 +166,12 @@ export async function submitVote(
         nativeToScVal(choice, { type: 'u32' })
       )
     )
-    .setTimeout(300) // 5 menit — lebih longgar
+    .setTimeout(300)
     .build();
 
-  debug('Unsigned tx built, XDR length:', unsignedTx.toXDR().length);
+  debug('Unsigned tx XDR len:', unsignedTx.toXDR().length);
 
-  // 3. Simulate untuk dapat soroban data + auth entries
+  // 3. Simulate
   const sim = await server.simulateTransaction(unsignedTx);
 
   if (sim.error) {
@@ -131,66 +179,69 @@ export async function submitVote(
     throw new Error(`Simulasi gagal: ${JSON.stringify(sim.error)}`);
   }
 
-  debug('Simulasi sukses. result keys:', Object.keys(sim.result ?? {}));
+  debug('Simulasi sukses');
 
-  // 4. Prepare transaction — INI BAGIAN KRITIS YANG DIPERBAIKI
-  //    pakai server.prepareTransaction() yang menangani:
-  //    - attach sorobanData dari simulasi
-  //    - attach auth entries (untuk require_auth() di kontrak)
-  //    - fix sequence number
-  let preparedTx;
+  // 4. Prepare transaction — pakai beberapa strategi
+  let preparedTx: Transaction;
   try {
-    preparedTx = server.prepareTransaction(unsignedTx, sim);
-    debug('Prepared tx sukses via prepareTransaction()');
-  } catch (e) {
-    debug('prepareTransaction gagal, coba manual:', e);
+    // Strategi 1: rpc.assembleTransaction (recommended v13)
+    // assembleTransaction return TransactionBuilder, perlu .build()
+    const assembled = (rpc as unknown as {
+      assembleTransaction?: (tx: Transaction, sim: Simulation.Response) => {
+        build: () => Transaction;
+      };
+    }).assembleTransaction?.(unsignedTx, sim);
 
-    // Fallback: manual attach sorobanData
-    const sorobanDataStr =
-      sim.result?.sorobanData ??
-      (sim as { sorobanData?: string }).sorobanData ??
-      sim.result?.transactionData;
-
-    if (!sorobanDataStr) {
-      throw new Error(
-        'Tidak bisa dapat sorobanData dari simulasi. Cek console untuk detail.'
-      );
+    if (assembled) {
+      preparedTx = assembled.build();
+      debug('Prepared via rpc.assembleTransaction()');
+    } else {
+      throw new Error('assembleTransaction tidak tersedia');
     }
-
-    const sorobanData = xdr.SorobanTransactionData.fromXDR(sorobanDataStr, 'base64');
-
-    preparedTx = new TransactionBuilder(sourceAccount, {
-      fee: '10000',
-      networkPassphrase: NETWORK_PASSPHRASE,
-      sorobanData,
-    })
-      .addOperation(
-        contract.call(
-          'vote',
-          new Address(session.publicKey).toScVal(),
-          nativeToScVal(choice, { type: 'u32' })
+  } catch (e1) {
+    debug('assembleTransaction gagal:', e1);
+    try {
+      // Strategi 2: server.prepareTransaction (instance method)
+      preparedTx = server.prepareTransaction(unsignedTx, sim) as Transaction;
+      if (typeof preparedTx.toXDR !== 'function') {
+        throw new Error('prepareTransaction return invalid type');
+      }
+      debug('Prepared via server.prepareTransaction()');
+    } catch (e2) {
+      debug('prepareTransaction gagal:', e2);
+      // Strategi 3: manual dengan SorobanDataBuilder
+      const sorobanData = extractSorobanData(sim);
+      preparedTx = new TransactionBuilder(sourceAccount, {
+        fee: '10000',
+        networkPassphrase: NETWORK_PASSPHRASE,
+        sorobanData,
+      })
+        .addOperation(
+          contract.call(
+            'vote',
+            new Address(session.publicKey).toScVal(),
+            nativeToScVal(choice, { type: 'u32' })
+          )
         )
-      )
-      .setTimeout(300)
-      .build();
-
-    debug('Prepared tx via fallback manual');
+        .setTimeout(300)
+        .build();
+      debug('Prepared via manual sorobanData');
+    }
   }
 
-  debug('Prepared tx XDR length:', preparedTx.toXDR().length);
+  debug('Prepared tx XDR len:', preparedTx.toXDR().length);
 
   // 5. Sign dengan wallet
   const signedXdr = await signXDR(preparedTx.toXDR(), session.type);
-  debug('Signed XDR length:', signedXdr.length);
+  debug('Signed XDR len:', signedXdr.length);
 
   const signedTx = TransactionBuilder.fromXDR(signedXdr, NETWORK_PASSPHRASE);
-  debug('Parsed signed tx, hash:', signedTx.hash().toString('hex'));
 
-  // 6. Submit ke RPC
+  // 6. Submit
   let result;
   try {
     result = await server.sendTransaction(signedTx);
-    debug('sendTransaction result:', result);
+    debug('sendTransaction result:', result.status, result.hash);
   } catch (e) {
     debug('sendTransaction exception:', e);
     throw new Error(`Network error saat submit: ${e instanceof Error ? e.message : String(e)}`);
@@ -198,18 +249,12 @@ export async function submitVote(
 
   if (result.status === 'ERROR') {
     debug('Submit ERROR:', result.errorResult);
-    let errorMsg = 'Transaksi gagal';
-    try {
-      errorMsg += `: ${JSON.stringify(result.errorResult)}`;
-    } catch {
-      errorMsg += ' (tidak bisa parse error)';
-    }
-    throw new Error(errorMsg);
+    throw new Error(`Transaksi gagal: ${JSON.stringify(result.errorResult)}`);
   }
 
   // 7. Polling untuk konfirmasi
   if (result.status === 'PENDING') {
-    debug('Pending, polling for confirmation...');
+    debug('Pending, polling...');
     for (let i = 0; i < 30; i++) {
       await new Promise((r) => setTimeout(r, 2000));
       const resp = await server.getTransaction(result.hash);
@@ -222,13 +267,10 @@ export async function submitVote(
       if (resp.status === 'FAILED') {
         throw new Error('Transaksi gagal on-chain');
       }
-      // NOT_FOUND atau PENDING → coba lagi
     }
     debug('Timeout polling, return hash anyway');
     return { hash: result.hash };
   }
 
-  // Status lain (misal TRY_AGAIN_LATER)
-  debug('Status tidak biasa:', result.status);
   return { hash: result.hash };
 }

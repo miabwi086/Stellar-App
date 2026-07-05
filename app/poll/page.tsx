@@ -115,7 +115,7 @@ export default function PollPage() {
         background: '#f9fafb',
       }}
     >
-      <div style={{ maxWidth: 600, margin: '0 auto' }}>
+      <div style={{ maxWidth: 600, margin: '0 auto', color: '#000000' }}>
         {/* Header */}
         <div
           style={{
