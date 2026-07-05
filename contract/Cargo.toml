@@ -1,23 +1,14 @@
-[package]
-name = "poll-contract"
-version = "0.1.0"
-edition = "2021"
+[source.crates-io]
+replace-with = "tuna"
 
-[lib]
-crate-type = ["cdylib"]
+[source.tuna]
+registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"
 
-[dependencies]
-soroban-sdk = "22.0.0"
+[http]
+check-revoke = false
+timeout = 300
+multiplexing = true
 
-[dev_dependencies]
-soroban-sdk = { version = "22.0.0", features = ["testutils"] }
-
-[profile.release]
-opt-level = "z"
-overflow-checks = true
-debug = 0
-strip = "symbols"
-debug-assertions = false
-panic = "abort"
-codegen-units = 1
-lto = true
+[net]
+git-fetch-with-cli = true
+retry = 5
