@@ -1,7 +1,6 @@
 ## 📝 README.md
 
-```markdown
-# Stellar dApp - Level 1 White Belt
+# Stellar dApp
 
 A simple Stellar decentralized application (dApp) built for the Stellar Developer Challenge Level 1. This application allows users to connect their Freighter wallet, view their XLM balance, and send XLM transactions on the Stellar Testnet.
 
